@@ -4,14 +4,14 @@ description: Pièges et patterns empiriques NocoDB v3 (CE 2026.04.5+) sur stack 
 metadata:
   spark:
     layer: data
-    source: spark-pitfalls-catalog (N1-N28)
+    source: spark-pitfalls-catalog (N1-N33)
     nocodb_version: "2026.04.5+ CE"
 ---
 
 # NocoDB v3 — pièges & patterns Spark
 
 > Couche **empirique** au-dessus de la skill `nocodb` (qui documente l'API v3 brute).
-> Ici : ce qui fait perdre 20-60 min à découvrir et 3 s à éviter. Cristallisé sur la chaîne WMS v2 (102 assertions E2E, 6 PRDs) puis enrichi (dernier : 2026-07-15, N26-N28 + N25 raffiné).
+> Ici : ce qui fait perdre 20-60 min à découvrir et 3 s à éviter. Cristallisé sur la chaîne WMS v2 (102 assertions E2E, 6 PRDs) puis enrichi (dernier : 2026-07-25, N30 + N33).
 > **Cible : NocoDB Community Edition 2026.04.5+, API v3, PAT (`xc-token`).**
 
 ---
@@ -47,6 +47,7 @@ GET /api/v3/data/{base}/{table}/links/{link_field_id}/{record_id}?fields=Id,nom,
 
 ⚠️ **N21** : sans `?fields=`, `/links` ne renvoie **que le display field** (1er SingleLineText). Tous les autres champs sont *omis* (même pas `null`). Toujours expliciter `?fields=`.
 ⚠️ **N26 — 🚨 le `?fields=` d'un `/links` doit inclure `Id`** : `?fields=code,nom` (sans `Id`) → `records: []` **vide silencieux** alors que les liens existent. Pire que N21 : on perd les records eux-mêmes, pas juste des champs. Toujours `?fields=Id,…`.
+⚠️ **N30 — `/links` d'un lien `bt` (belongsTo) renvoie `{record: {...}}` SINGULIER** (pas `{records: [...]}`) — un consumer qui lit `.records` obtient `[]`/undefined en silence. Gérer les deux formes : `resp.record || (resp.records || [])[0]`. (Vécu 2026-07-17, dossiers.couleur_stock.)
 ⚠️ Résolution N+1 par défaut → voir pattern d'agrégat par Lookups plus bas (N24).
 
 ### 3. `where` sur un champ Link ne marche pas (N7/N8)
@@ -68,7 +69,7 @@ Deux contournements (N8) :
 
 ---
 
-## Lookups (N19/N20/N24/N25/N27/N29)
+## Lookups (N19/N20/N24/N25/N27/N29/N33)
 
 Les Lookups sont la bonne arme contre le N+1 sur les agrégats — mais 6 chausse-trappes :
 
@@ -78,6 +79,7 @@ Les Lookups sont la bonne arme contre le N+1 sur les agrégats — mais 6 chauss
 - **N25 (raffiné 2026-07-15) — 🚨 la collision de Lookups est PAR LIEN** : plusieurs Lookups du **même** Link coexistent dans un seul `?fields=` (ex. `sku_code_lookup` + `sku_libelle_complet`, tous deux via le Link `sku_kyklos` → les 2 corrects). C'est un Lookup d'un **autre** Link dans le même `?fields=` qui revient `[null]` — valeur perdue, sur `/records/{id}` comme sur les listes. **Workaround : 1 fetch HTTP par Link porteur de Lookups** (pas par Lookup), combiner dans Build Response. ⚠️ **Faux négatif de test** : sur un record dont le lien est vide, `[]` semble correct → tester la collision sur un record où **tous** les liens concernés sont peuplés avant de "simplifier" des fetchs séparés existants.
 - **N27 — 🚨 Lookup sur un lien `mo` (many-to-one) = `null` systématique** : un Lookup posé sur un Link `relation_type: "mo"` renvoie `null` partout, même config identique aux Lookups qui marchent et lien peuplé. Les Lookups sur `belongsTo` et sur `mm` fonctionnent. **Vérifier `relation_type` du Link (meta table) AVANT de créer un Lookup dessus.** Workaround batching sans changement de schéma : joindre via une table intermédiaire belongsTo + colonne FK dénormalisée (ex. `dossiers → ligne_commande` par `/links` inverse par ligne + `lignes_commande.produit_kyklos_id`) → O(intermédiaires) appels au lieu de O(records).
 - **N29 — 🔥 Lookup `mm` sur une LISTE = superlinéaire (fondeur de Postgres)** : `records?pageSize=N&fields=…,lookup_mm` → N=50 : 0,5 s · N=150 : 6-8 s · N=500 : 25 s+ **et Postgres à 190 % CPU / +2 GiB** (cause racine d'OOM récurrents sur kyklos — endpoint appelé à chaque ouverture d'écran). Les requêtes zombies survivent aux timeouts client et au restart du client NocoDB — seul un restart Postgres purge. **Fix = inversion de requête** : partir de l'objet demandé (`/links` inverse : « les X compatibles de CE parent », trivial) puis ne fetcher que ces records (`where=(Id,in,…)`). Diagnostiquer par paliers de pageSize (5→50→150) pour isoler le champ toxique sans re-fondre la base.
+- **N33 — 🚨 la superlinéarité N29 frappe AUSSI les Lookups `belongsTo`, juste plus tard** : un Lookup bt dans le `?fields=` d'une **liste** tient jusqu'à ~200 rows (≈2 s) puis s'effondre vers ~600 rows : **40-45 s puis `ERR_INTERNAL_SERVER`** (`fields=Id` seul : <1 s — vécu 2026-07-25, table de jonction à 615 rows, les 2 Lookups testés séparément, même verdict). Un fetch qui « marchait » à 200 rows casse silencieusement quand la table grossit. Remèdes par ordre : ① le **compteur de Link suffit souvent** (N5 : le champ Link en liste = nombre de liens — « ce record a-t-il ≥1 lien ? » ne coûte aucun Lookup) ; ② pagination ≤200 rows si les valeurs sont vraiment nécessaires ; ③ `/links` du parent ciblé (peu de rows par parent — le pattern par-parent reste sain). Après l'échec, Postgres retombe seul (pas de zombie type N29) mais garde ~1,6 GiB de caches.
 
 ---
 
@@ -112,7 +114,7 @@ Les Lookups sont la bonne arme contre le N+1 sur les agrégats — mais 6 chauss
 
 1. Écriture avec FK ? → insert **puis** `POST /links` (N3/N4).
 2. Lecture qui a besoin des FK ? → `/links?fields=Id,…` explicite (N21 + **Id obligatoire** N26), ou Lookups (N24) en pesant N25/N27 (1 fetch par **lien** ; jamais sur un lien `mo`).
-2bis. Lookup mm dans un fetch **liste** ? → **N29** : superlinéaire, interdit au-delà de ~50 rows. Inverser la requête (/links du parent + `(Id,in,…)`).
+2bis. Lookup dans un fetch **liste** ? → **N29/N33** : superlinéaire — `mm` interdit au-delà de ~50 rows, `bt` s'effondre vers ~600. Inverser la requête (/links du parent + `(Id,in,…)`), ou **compteur de Link** si seul « ≥1 lien ? » compte.
 3. Filtre sur relation ? → **pas** de `where` sur Link (N7) ; /links inverse (N8a) ou dénorm (N8b) ; FK normale = nom de colonne réel.
 4. Bulk ? → batch de 10 + check du retour (N2).
 5. Lecture de l'id créé ? → `records[0].id`.
