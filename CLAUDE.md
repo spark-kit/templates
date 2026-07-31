@@ -31,9 +31,11 @@ Distillation toujours-en-contexte (le detail vit dans les skills coeur). Si un s
 
 **NocoDB (data)**
 - **N3/N4** : insert avec FK ≠ creation du lien (juste un compteur fantome). Apres l'insert, POST `/api/v3/data/{base}/{table}/links/{link_field_id}/{record_id}` body `[{id:X}]`.
-- **N5/N21/N26** : lecture Links = compteurs, pas d'objets. Resoudre via `/links?fields=Id,nom,...` (sans `?fields=`, seul le display field revient ; sans `Id` dans le fields → `records:[]` vide silencieux).
+- **N34** : POST `/links` **AJOUTE** un lien, il ne remplace jamais — **meme sur un `belongsTo`**. Le record se retrouve a 2 liens, le Lookup renvoie 2 valeurs, et tout lecteur en `[0]` voit l'ancienne. Re-liaison = GET liens actuels → DELETE ce qui n'est pas la cible → POST → **relire et verifier qu'il n'en reste qu'un**.
+- **N5/N21/N26/N35** : lecture Links = compteurs, pas d'objets. Resoudre via `/links?fields=Id,nom,...` (sans `?fields=`, seul le display field revient ; sans `Id` dans le fields → `records:[]` vide silencieux). **N35** : le « compteur » n'est vrai qu'en fetch **liste** — en `GET /records/{id}` c'est un objet expanse (donc toujours truthy), `?fields=` n'y change rien. Une garde `if (champ || 0) !== 0` passe sur la liste et echoue toujours par id.
 - **N7** : `?where=(champ_link,eq,X)` ne filtre PAS (renvoie 0). Passer par le `/links` inverse, ou un Link `belongsTo` denormalise direct.
 - **N2** : bulk insert ET delete cap a **10**/call. Le delete >10 echoue **silencieusement** (0 supprime, aucune erreur). Batcher + verifier le retour.
+- **N36** : un endpoint **get-or-create** (Find → IF → Insert) n'est **pas atomique**. Un node HTTP n8n itere sur ses items : N items visant la meme cle → N inserts → **doublons**. NocoDB n'a aucune contrainte d'unicite pour les refuser. **Dedupliquer par cle AVANT le fan-out**, puis re-etaler.
 - **N25/N27** : Lookups de liens **differents** dans le meme `?fields=` s'ecrasent (`[null]`) → 1 fetch par **lien** (Lookups d'un meme lien = partageables). Lookup sur un lien **m2m** = null systematique → verifier `relation_type` avant de le creer.
 - **N28** : GET `/records/{id}` sans `?fields=` = 10-35× plus lent (NocoDB resout toutes les expansions). `?fields=` systematique sur les GET par id.
 - **N29** : Lookup mm dans un fetch **liste** = superlinéaire (150 rows=8s, 500=25s+ et Postgres a 190%). Inverser la requete : `/links` inverse du parent puis `where=(Id,in,...)`.
