@@ -91,6 +91,30 @@ export NOCODB_HOST_HEADER="<prefix>-db.<domain>"               # Caddy route par
 
 Le trafic reste local (127.0.0.1), ne traverse jamais Cloudflare → insensible à CF Access, pas de token. (Service Token CF = uniquement off-host / audit du 302 public.) Détail : `docs/cf-access.md`.
 
+### 🚨 C7 — sans en-tête `Host`, Caddy répond **200 avec un corps VIDE**
+
+Caddy route **par Host header**. Une requête sur `http://127.0.0.1:<port>/…` **sans** cet en-tête ne tombe sur aucun vhost et rend un **200 vide** — pas un 404, pas une erreur.
+
+Ce qui rend le piège coûteux, c'est la façon dont on « vérifie » :
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/webhook/api/wms/pieces   # → 200 … et un corps vide
+```
+
+Un script de test qui ne regarde que le **code HTTP** conclut que l'API répond. Vécu 2026-08-05 : un E2E a rendu **29 assertions rouges** sans jamais atteindre n8n — une assertion rouge dit « le code est cassé », alors qu'elle disait en fait « ta requête n'est jamais arrivée ». Une demi-heure perdue à chercher dans le mauvais service.
+
+➡️ **Deux réflexes** :
+1. Vérifier un endpoint sur son **corps**, jamais sur son code HTTP seul.
+2. Donner à tout script de test un **contrôle [0]** qui s'arrête net si l'API ne rend pas du JSON exploitable, en rappelant la commande correcte :
+
+```bash
+if ! call GET /pieces | python3 -c "import json,sys; sys.exit(0 if isinstance(json.load(sys.stdin).get('pieces'), list) else 1)" 2>/dev/null; then
+  echo "✗ $API ne rend pas de JSON (302 CF Access, ou Caddy sans Host header ?)"
+  echo "  WMS_API_BASE=http://127.0.0.1:18080/webhook/api/wms WMS_HOST_HEADER=<prefix>-app.<domain> bash $0"
+  exit 2
+fi
+```
+
 ---
 
 ## n8n — accès fichiers du repo

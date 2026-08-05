@@ -4,14 +4,14 @@ description: Pièges et patterns empiriques NocoDB v3 (CE 2026.04.5+) sur stack 
 metadata:
   spark:
     layer: data
-    source: spark-pitfalls-catalog (N1-N36)
+    source: spark-pitfalls-catalog (N1-N39)
     nocodb_version: "2026.04.5+ CE"
 ---
 
 # NocoDB v3 — pièges & patterns Spark
 
 > Couche **empirique** au-dessus de la skill `nocodb` (qui documente l'API v3 brute).
-> Ici : ce qui fait perdre 20-60 min à découvrir et 3 s à éviter. Cristallisé sur la chaîne WMS v2 (102 assertions E2E, 6 PRDs) puis enrichi (dernier : 2026-07-31, N34 + N35 + N36 — les trois trouvés dans un même chantier de re-liaison, et **tous les trois silencieux**).
+> Ici : ce qui fait perdre 20-60 min à découvrir et 3 s à éviter. Cristallisé sur la chaîne WMS v2 (102 assertions E2E, 6 PRDs) puis enrichi en continu — 2026-07-31 : **N34-N36** (un même chantier de re-liaison, tous les trois silencieux) · 2026-08-05 : **N37-N39** (coût caché d'un lien en lecture, sémantique d'écriture par `relation_type`).
 > **Cible : NocoDB Community Edition 2026.04.5+, API v3, PAT (`xc-token`).**
 
 ---
@@ -58,6 +58,18 @@ GET  /links/{field}/{id}?fields=Id     → RELIRE : exactement 1, et le bon
 ```
 
 La relecture finale n'est pas du zèle : c'est elle qui transforme un « 80/80 re-liés » mensonger en échec bruyant. (Vécu 2026-07-31, réalignement de 80 dossiers.)
+
+**N38 — 🚨 le comportement de POST `/links` dépend du `relation_type`, et les noms mentent.** N34 ci-dessus est vrai pour un `belongsTo` ; ce n'est **pas** la règle générale. Vérifié en base le 2026-08-05, en lisant `/links` (jamais l'objet expansé — c'est précisément N35 qui rend cette vérification fiable) :
+
+| `relation_type` réel | POST `/links` sur un lien déjà posé | Conséquence pratique |
+|---|---|---|
+| **`belongsTo`** | **ajoute** (N34) → 2 liens, Lookup à 2 valeurs, `[0]` lit l'ancienne | DELETE des liens actuels → POST → **relire** |
+| **`mo`** (many-to-one) | **remplace** — après deux POST successifs, `/links` ne montre qu'**une** entrée | un seul appel suffit pour changer la cible |
+| **`mm`** | **idempotent** dans les deux sens (double DELETE → `{success:true}` ; double POST → compteur reste à 1) | rejouable sans garde préalable |
+
+⚠️ Le piège du piège : `mo` et `belongsTo` sonnent tous deux « 1:1 » et se comportent à l'**opposé**. Un champ nommé pareil dans deux tables peut avoir l'un ou l'autre (`pieces.piece_type` = `mo`, `dossiers.sku_kyklos` = `belongsTo`). ➡️ **Lire `relation_type` dans la meta avant d'écrire** — et dans le doute, appliquer le pattern de re-liaison de N34, qui est correct dans les trois cas.
+
+⚠️ **N39 — DELETE d'un *record* inexistant → 404, alors que DELETE d'un *lien* inexistant rend `{success:true}`.** Asymétrie piégeuse : ne supprimer que des ids qu'on vient de **lire**, jamais un id déduit. Corollaire pour une double SoT (jonction explicite **+** m2m natif, cas fréquent) : le m2m se rejoue sans risque, **la ligne de jonction non** — un « lier » naïf rejoué laisse le m2m propre et crée un doublon de jonction. Lire les jonctions existantes avant d'en créer une.
 
 ### 2. Lecture Links = compteurs, pas d'objets (N5/N6/N21)
 
@@ -113,6 +125,8 @@ Les Lookups sont la bonne arme contre le N+1 sur les agrégats — mais 6 chauss
 - **N29 — 🔥 Lookup `mm` sur une LISTE = superlinéaire (fondeur de Postgres)** : `records?pageSize=N&fields=…,lookup_mm` → N=50 : 0,5 s · N=150 : 6-8 s · N=500 : 25 s+ **et Postgres à 190 % CPU / +2 GiB** (cause racine d'OOM récurrents sur kyklos — endpoint appelé à chaque ouverture d'écran). Les requêtes zombies survivent aux timeouts client et au restart du client NocoDB — seul un restart Postgres purge. **Fix = inversion de requête** : partir de l'objet demandé (`/links` inverse : « les X compatibles de CE parent », trivial) puis ne fetcher que ces records (`where=(Id,in,…)`). Diagnostiquer par paliers de pageSize (5→50→150) pour isoler le champ toxique sans re-fondre la base.
 - **N33 — 🚨 la superlinéarité N29 frappe AUSSI les Lookups `belongsTo`, juste plus tard** : un Lookup bt dans le `?fields=` d'une **liste** tient jusqu'à ~200 rows (≈2 s) puis s'effondre vers ~600 rows : **40-45 s puis `ERR_INTERNAL_SERVER`** (`fields=Id` seul : <1 s — vécu 2026-07-25, table de jonction à 615 rows, les 2 Lookups testés séparément, même verdict). Un fetch qui « marchait » à 200 rows casse silencieusement quand la table grossit. Remèdes par ordre : ① le **compteur de Link suffit souvent** (N5 : le champ Link en liste = nombre de liens — « ce record a-t-il ≥1 lien ? » ne coûte aucun Lookup) ; ② pagination ≤200 rows si les valeurs sont vraiment nécessaires ; ③ `/links` du parent ciblé (peu de rows par parent — le pattern par-parent reste sain). Après l'échec, Postgres retombe seul (pas de zombie type N29) mais garde ~1,6 GiB de caches.
 
+- **N37 — 🚨 même SANS Lookup, demander un champ `belongsTo` dans le `?fields=` d'une LISTE coûte comme un Lookup** : NocoDB résout la ligne liée **entière** (avec ses propres compteurs de liens) pour chaque row. Mesuré sur 664 rows, pageSize=1000 : `fields=` sans le lien → **0,08 s / 227 KB** ; `+ piece_type` (belongsTo) → **0,88 s / 411 KB** (×11) ; `+ modeles_compatibles` (compteur mm) → **0,08 s** (gratuit). C'est N28 (le coût des expansions) qui frappe en liste, pas seulement sur un GET par id. **Contournement quand on ne veut qu'un booléen « ce record a-t-il ce lien ? »** : une requête dédiée `?fields=Id&where=(champ_link,isblank)` rend les seuls ids concernés — **0,06 s / 4 KB pour 88 ids**. ⚠️ `isblank`/`notblank` **filtrent bien sur une colonne Link** (contrairement à `eq`, cf. N7) ; `(champ,is,null)` renvoie **0 ligne en silence**. (Vécu 2026-08-05, endpoint de liste appelé par 3 écrans atelier.)
+
 ---
 
 ## Idempotence & concurrence (N36)
@@ -165,13 +179,16 @@ NocoDB **n'a pas de contrainte d'unicité applicative** sur un SingleLineText : 
 ## Check-list avant tout HTTP NocoDB dans un workflow
 
 1. Écriture avec FK ? → insert **puis** `POST /links` (N3/N4).
-1bis. **Re**-liaison (le record a déjà un lien) ? → **N34** : le POST ajoute, il ne remplace pas, même en `belongsTo`. DELETE des liens actuels → POST la cible → **relire** et vérifier qu'il n'en reste qu'un.
+1bis. **Re**-liaison (le record a déjà un lien) ? → **N34/N38** : le POST **ajoute** sur un `belongsTo` (il ne remplace pas, malgré le nom) mais **remplace** sur un `mo` — lire `relation_type` avant d'écrire, ou appliquer le pattern sûr dans les deux cas : DELETE des liens actuels → POST la cible → **relire** et vérifier qu'il n'en reste qu'un.
 2. Lecture qui a besoin des FK ? → `/links?fields=Id,…` explicite (N21 + **Id obligatoire** N26), ou Lookups (N24) en pesant N25/N27 (1 fetch par **lien** ; jamais sur un lien `mo`).
 2ter. Garde/compteur sur un champ Links ? → **N35** : compteur en fetch **liste** seulement ; en `GET /records/{id}` c'est un objet expansé, donc toujours truthy.
 2bis. Lookup dans un fetch **liste** ? → **N29/N33** : superlinéaire — `mm` interdit au-delà de ~50 rows, `bt` s'effondre vers ~600. Inverser la requête (/links du parent + `(Id,in,…)`), ou **compteur de Link** si seul « ≥1 lien ? » compte.
 3. Filtre sur relation ? → **pas** de `where` sur Link (N7) ; /links inverse (N8a) ou dénorm (N8b) ; FK normale = nom de colonne réel.
+3bis. Besoin de savoir seulement **si** un lien existe, sur une liste ? → **jamais** le champ belongsTo dans le `?fields=` (N37, ×11 sur 664 rows) : requête dédiée `?fields=Id&where=(champ_link,isblank)`. Un **compteur** de lien mm, lui, est gratuit (N5).
 4. Bulk ? → batch de 10 + check du retour (N2).
 5. Lecture de l'id créé ? → `records[0].id`.
 6. GET par id ? → `?fields=` systématique, sinon 10-35× plus lent (N28).
+7. Écriture de lien **rejouable** ? → le POST **ajoute** sur un `belongsTo` (N34) mais **remplace** sur un `mo` — lire `relation_type` avant d'écrire (N38) ; un `mm` est idempotent, une ligne de **jonction** non : la lire avant de la créer, et ne DELETE que des ids lus (N39).
+8. Un endpoint qui reçoit un id de ligne « à mettre à jour » de son appelant ? → le **résoudre lui-même** (`where` sur les colonnes scalaires dénormalisées, N8b — ça, ça filtre) plutôt que de faire confiance : deux appelants finissent toujours par diverger, et c'est l'écrivain qui porte l'invariant. (Vécu : 138 lignes dupliquées sur 555.)
 
 > Promouvoir tout nouveau piège confirmé ici **et** dans `spark-kit/INCIDENTS.md` s'il est transverse à plusieurs sites.

@@ -64,6 +64,16 @@ n8n CE n'a **pas** de merge/wait fiable. Un Code node "Build Response" en aval d
 
 ➡️ Tout en **chaîne séquentielle** : `Fetch A → Fetch B → Fetch C → Build Response`. Légèrement plus lent, 100 % fiable.
 
+**W24 — 🚨 un node qui renvoie 0 item ARRÊTE la chaîne** : les nodes suivants ne s'exécutent pas, `Respond` compris → le webhook répond **200 avec un corps vide**, sans erreur nulle part. C'est le piège qui pousse à remettre des IF (et donc du fan-in, W9). ➡️ Dans une chaîne linéaire, un Code node conditionnel doit **toujours émettre ≥ 1 item** : à défaut de travail, un **no-op inoffensif** (typiquement un GET `?fields=Id` sur le record déjà connu). Une ligne de commentaire suffit à ce que le prochain lecteur ne le « simplifie » pas.
+
+```js
+// rien à faire, mais la chaîne doit rester vivante (un node à 0 item tue le Respond)
+if (!aFaire.length) {
+  return [{ json: { noop: true, method: 'GET', body: '[]',
+                    url: `${NOCO}/${TABLE}/records/${id}?fields=Id` } }];
+}
+```
+
 ## IF node (W5/W21)
 
 - **W5** : `conditions.options = {version:2, leftValue:"", caseSensitive:true, typeValidation:"strict"}` est **obligatoire** (le validator MCP refuse sinon).
@@ -75,6 +85,20 @@ n8n CE n'a **pas** de merge/wait fiable. Un Code node "Build Response" en aval d
 method = ={{ $json.mode === 'insert' ? 'POST' : 'PATCH' }}
 ```
 **W20** : ça déclenche un faux positif "Invalid value for method" en validation MCP **mais fonctionne au runtime**. Ignorer le warning, activer quand même.
+
+### Le pattern qui en découle : « un item = un appel » (W17 poussé au bout)
+
+Si `method`, `url` **et** `jsonBody` sont tous des expressions, **un seul** node HTTP exécute une **séquence d'appels hétérogènes** — un par item d'entrée. Un Code node en amont décide de la liste des appels ; le node HTTP ne fait que dérouler.
+
+```js
+// Code "Prep" : 1 item = 1 appel. Ordre garanti, un item de sortie par item d'entrée.
+return calls.map(c => ({ json: c }));   // {quoi, method, url, body}
+```
+```
+method = ={{ $json.method }}   url = ={{ $json.url }}   jsonBody = ={{ $json.body }}
+```
+
+Ça remplace des cascades d'IF (donc du fan-in W9) pour tout endpoint « pose N liens de natures différentes » : lien belongsTo + n lignes de jonction + batches m2m dans une seule chaîne linéaire. Quand une étape dépend du **retour** de la précédente (id d'insert), faire **deux tours** : `Prep → Appels tour 1 → Prep tour 2 → Appels tour 2`. ⚠️ Le remapping entre tours se fait **par index** (le node HTTP rend un item de sortie par item d'entrée, dans l'ordre) : vérifier `sorties.length === entrées.length` et **`throw`** sinon — un lien posé sur le mauvais parent ne se voit jamais.
 
 ---
 
@@ -115,6 +139,17 @@ Plus simple que le node `Execute Workflow`, transparent au runtime, permet de r�
 - **Copier un pattern existant** : `n8n_get_workflow`.
 - **W18** : un `n8n_update_partial_workflow` est actif **immédiatement** (pas de reload webhook).
 - **W22/N-MCP** : `patchNodeField` ne patche pas `parameters.assignments.assignments` (object) → `updateNode` avec l'array complet. `n8n_update_full_workflow` exige `name` (sinon 422).
+
+---
+
+## Patcher un workflow ACTIF par l'API REST v1 (W25/W26)
+
+Sur un site sans MCP (le canal recommandé depuis 2026-07), on patche en `GET → modifier le JSON en Python → PUT {name, nodes, connections, settings}`. Deux pièges qui coûtent chacun une demi-heure, et le second a mis un endpoint de production par terre.
+
+- **W25 — 🚨 un PUT qui change le GRAPHE n'est PAS pris en compte par l'instance active.** W18 (« actif immédiatement ») ne vaut que pour un changement de **paramètres**. Dès qu'on **ajoute des nodes ou des connexions**, l'instance active continue de servir **l'ancien graphe** : le GET de contrôle montre bien les nouveaux nodes et les bonnes connexions, mais l'exécution n'en enchaîne que les anciens — on croit à un bug de son propre code. ➡️ **`POST /activate` après `POST /deactivate`** à chaque changement de graphe. À mettre dans le script de patch, pas dans la tête.
+- **W26 — 🚨 `nodeCredentialType` SEUL ne suffit pas sur un node créé par l'API.** Un node HTTP construit à la main avec `authentication: predefinedCredentialType` + `nodeCredentialType: 'nocoDbApiToken'` part en **`Credentials not found`** au runtime — l'objet `credentials` est un champ **à part**, absent par défaut. Le workflow paraît parfait à la relecture API. ➡️ **Recopier `credentials` d'un node voisin qui marche** : `{'nocoDbApiToken': {'id': '…', 'name': '…'}}`.
+
+**Le garde-fou qui rend ces deux pièges bénins** : sauvegarder le workflow (`GET` → fichier) **avant** le patch, et écrire le script de patch avec des **assertions sur l'état de départ** (nom du workflow, présence des nodes attendus, code exact des Code nodes touchés, connexions attendues) — puis `--dry-run` par défaut, `--execute` explicite. Un patch qui échoue bruyamment sur un état inattendu vaut mieux qu'un patch qui « marche » sur un workflow qui a bougé. Restaurer = un PUT du fichier de sauvegarde.
 
 ---
 
