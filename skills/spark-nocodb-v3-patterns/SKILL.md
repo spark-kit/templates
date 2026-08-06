@@ -1,17 +1,17 @@
 ---
 name: spark-nocodb-v3-patterns
-description: Pièges et patterns empiriques NocoDB v3 (CE 2026.04.5+) sur stack Spark. Use when modeling data, creating NocoDB tables/fields, writing n8n workflows that read/write NocoDB, debugging Links/Lookups/filters, or hitting "le lien ne se crée pas", "where sur FK renvoie 0", "bulk delete silencieux", "Lookup renvoie un array/null", "/links renvoie records vide", "GET record lent". Complète (ne remplace pas) la skill `nocodb` de référence API.
+description: Pièges et patterns empiriques NocoDB v3 (CE 2026.04.5+) sur stack Spark. Use when modeling data, creating NocoDB tables/fields, writing n8n workflows that read/write NocoDB, debugging Links/Lookups/filters, or hitting "le lien ne se crée pas", "where sur FK renvoie 0", "bulk delete silencieux", "Lookup renvoie un array/null", "/links renvoie records vide", "GET record lent", "le record a deux liens", "le Lookup renvoie deux valeurs", "get-or-create a créé un doublon", "ma garde sur un champ Links ne marche que parfois". Complète (ne remplace pas) la skill `nocodb` de référence API.
 metadata:
   spark:
     layer: data
-    source: spark-pitfalls-catalog (N1-N33)
+    source: spark-pitfalls-catalog (N1-N36)
     nocodb_version: "2026.04.5+ CE"
 ---
 
 # NocoDB v3 — pièges & patterns Spark
 
 > Couche **empirique** au-dessus de la skill `nocodb` (qui documente l'API v3 brute).
-> Ici : ce qui fait perdre 20-60 min à découvrir et 3 s à éviter. Cristallisé sur la chaîne WMS v2 (102 assertions E2E, 6 PRDs) puis enrichi (dernier : 2026-07-25, N30 + N33).
+> Ici : ce qui fait perdre 20-60 min à découvrir et 3 s à éviter. Cristallisé sur la chaîne WMS v2 (102 assertions E2E, 6 PRDs) puis enrichi (dernier : 2026-07-31, N34 + N35 + N36 — les trois trouvés dans un même chantier de re-liaison, et **tous les trois silencieux**).
 > **Cible : NocoDB Community Edition 2026.04.5+, API v3, PAT (`xc-token`).**
 
 ---
@@ -36,6 +36,29 @@ POST /api/v3/data/{base}/{table}/links/{link_field_id}/{record_id}
 
 Dans un workflow n8n : insert → récupérer l'id créé (`{{ $json.records[0].id }}`) → 1 POST `/links` par FK. C'est **le** pattern de toute écriture avec relations.
 
+⚠️ **N34 — 🚨 POST `/links` AJOUTE un lien, il ne REMPLACE jamais — même sur un `belongsTo`.** Le nom de la relation promet 1:1, l'API n'en tient aucun compte :
+
+```jsonc
+// dossiers.sku_kyklos est déclaré "relation_type": "belongsTo"
+POST /links/{link_field_id}/285   [{"id": 339}]        → 200 OK
+GET  /links/{link_field_id}/285                        → records: [{id:214}, {id:339}]   // DEUX
+GET  /records/285?fields=Id,sku_kyklos,sku_code_lookup
+     → { "sku_kyklos": 2, "sku_code_lookup": ["…-A0M10", "…-A0210"] }   // compteur 2, Lookup à 2
+```
+
+Aucune erreur, aucun avertissement. Le compteur de Link passe à `2` sur une relation censée être 1:1 et le Lookup (N20) renvoie **deux** valeurs. Tout consommateur qui fait `champ[0]` continue de lire l'**ancienne** — la correction paraît avoir échoué alors qu'elle a *doublé* la donnée. Pire cas : un écran lit `[0]`, un autre `[1]`, et les deux sont « cohérents avec eux-mêmes ».
+
+**Pattern de re-liaison idempotent** — ne jamais présumer qu'un POST remplace, quel que soit le `relation_type` déclaré :
+
+```
+GET  /links/{field}/{id}?fields=Id     → liens actuels
+DELETE /links/{field}/{id}  [{id:…}, …]   // tout ce qui n'est pas la cible
+POST   /links/{field}/{id}  [{id: cible}] // seulement si absent
+GET  /links/{field}/{id}?fields=Id     → RELIRE : exactement 1, et le bon
+```
+
+La relecture finale n'est pas du zèle : c'est elle qui transforme un « 80/80 re-liés » mensonger en échec bruyant. (Vécu 2026-07-31, réalignement de 80 dossiers.)
+
 ### 2. Lecture Links = compteurs, pas d'objets (N5/N6/N21)
 
 La liste des records renvoie `0/1/2…` sur les champs Link (nombre de liens), **jamais** l'objet expansé (contrairement à v1).
@@ -48,6 +71,15 @@ GET /api/v3/data/{base}/{table}/links/{link_field_id}/{record_id}?fields=Id,nom,
 ⚠️ **N21** : sans `?fields=`, `/links` ne renvoie **que le display field** (1er SingleLineText). Tous les autres champs sont *omis* (même pas `null`). Toujours expliciter `?fields=`.
 ⚠️ **N26 — 🚨 le `?fields=` d'un `/links` doit inclure `Id`** : `?fields=code,nom` (sans `Id`) → `records: []` **vide silencieux** alors que les liens existent. Pire que N21 : on perd les records eux-mêmes, pas juste des champs. Toujours `?fields=Id,…`.
 ⚠️ **N30 — `/links` d'un lien `bt` (belongsTo) renvoie `{record: {...}}` SINGULIER** (pas `{records: [...]}`) — un consumer qui lit `.records` obtient `[]`/undefined en silence. Gérer les deux formes : `resp.record || (resp.records || [])[0]`. (Vécu 2026-07-17, dossiers.couleur_stock.)
+⚠️ **N35 — 🚨 « compteur » n'est vrai qu'en fetch LISTE : en `GET /records/{id}`, un champ Links renvoie l'OBJET EXPANSÉ** — et le `?fields=` n'y change rien, c'est la **route** qui décide :
+
+```jsonc
+GET /records?where=(Id,eq,299)&fields=Id,produit_kyklos   → { "produit_kyklos": 1 }          // compteur
+GET /records/299?fields=Id,produit_kyklos                 → { "produit_kyklos": { "Id": 1008,
+      "code_produit": "…", "_nc_m2m_sku_kyklos_produit_kyklos": [ … ] } }                    // ~4 ko
+```
+
+Conséquence directe : toute garde numérique du type `if (champ || 0) !== 0` **passe sur la liste et échoue toujours par id**, l'objet étant systématiquement truthy. Pour lire un compteur, passer par une liste (`?where=(Id,eq,X)&pageSize=1`). C'est le même mécanisme que **N28** (GET par id 10-35× plus lent) vu de l'autre côté : la lenteur et l'expansion sont un seul phénomène. (Vécu 2026-07-31, garde de suppression d'un doublon.)
 ⚠️ Résolution N+1 par défaut → voir pattern d'agrégat par Lookups plus bas (N24).
 
 ### 3. `where` sur un champ Link ne marche pas (N7/N8)
@@ -83,6 +115,26 @@ Les Lookups sont la bonne arme contre le N+1 sur les agrégats — mais 6 chauss
 
 ---
 
+## Idempotence & concurrence (N36)
+
+**N36 — 🚨 un get-or-create NocoDB n'est pas atomique : appelé en fan-out sur la même clé, il crée des doublons.** Le pattern canonique d'un endpoint « résoudre-ou-créer » est `Find (where=clé)` → `IF Exists` → `Insert`. Correct appelé une fois. Mais un node HTTP n8n **itère sur ses items d'entrée** : N items visant la même clé produisent N `Find` qui ne trouvent rien, puis N `Insert`.
+
+```
+item A → clé "APP-IP11-64-MX-C0210"  ┐ les deux Find ne trouvent rien,
+item B → clé "APP-IP11-64-MX-C0210"  ┘ les deux insèrent → 2 records, même clé
+```
+
+NocoDB **n'a pas de contrainte d'unicité applicative** sur un SingleLineText : rien ne refuse le second insert. Le doublon ne casse rien tout de suite — il casse **au coup suivant**, quand un consommateur résout `clé → id` : un `dict[clé] = id` garde le dernier, et une écriture ciblée (DELETE d'un lien, PATCH) frappe le jumeau. Le symptôme apparaît alors à plusieurs nœuds de la cause, dans une exécution *antérieure*.
+
+**Trois remèdes, cumulatifs** :
+1. **Dédupliquer AVANT le fan-out** — un item par clé cible distincte, puis ré-étaler le résultat sur les items d'origine (`byCle[réponse.clé] = id`).
+2. **Ne jamais résoudre par clé naturelle ce qu'on peut lire directement** — pour délier, lire les liens réels du record (`GET /links`) plutôt que traduire une clé en id. Robuste aux doublons *et* aux N34 déjà en place.
+3. **Un invariant d'unicité dans le harnais E2E** — `SELECT clé HAVING count(*) > 1` sur la table de référence. Sur un cas réel, il a immédiatement sorti un doublon **préexistant** que personne n'avait vu : la classe de bug était déjà là.
+
+> Corollaire de méthode : « risque de concurrence documenté et assumé » sur une écriture unitaire ne l'assume **pas** en fan-out. C'est la même ligne de code, avec N appels au lieu d'un. Re-qualifier le risque quand l'appelant change de forme. (Vécu 2026-07-31.)
+
+---
+
 ## CRUD & schéma — réflexes
 
 | # | Règle |
@@ -113,7 +165,9 @@ Les Lookups sont la bonne arme contre le N+1 sur les agrégats — mais 6 chauss
 ## Check-list avant tout HTTP NocoDB dans un workflow
 
 1. Écriture avec FK ? → insert **puis** `POST /links` (N3/N4).
+1bis. **Re**-liaison (le record a déjà un lien) ? → **N34** : le POST ajoute, il ne remplace pas, même en `belongsTo`. DELETE des liens actuels → POST la cible → **relire** et vérifier qu'il n'en reste qu'un.
 2. Lecture qui a besoin des FK ? → `/links?fields=Id,…` explicite (N21 + **Id obligatoire** N26), ou Lookups (N24) en pesant N25/N27 (1 fetch par **lien** ; jamais sur un lien `mo`).
+2ter. Garde/compteur sur un champ Links ? → **N35** : compteur en fetch **liste** seulement ; en `GET /records/{id}` c'est un objet expansé, donc toujours truthy.
 2bis. Lookup dans un fetch **liste** ? → **N29/N33** : superlinéaire — `mm` interdit au-delà de ~50 rows, `bt` s'effondre vers ~600. Inverser la requête (/links du parent + `(Id,in,…)`), ou **compteur de Link** si seul « ≥1 lien ? » compte.
 3. Filtre sur relation ? → **pas** de `where` sur Link (N7) ; /links inverse (N8a) ou dénorm (N8b) ; FK normale = nom de colonne réel.
 4. Bulk ? → batch de 10 + check du retour (N2).
