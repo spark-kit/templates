@@ -74,6 +74,11 @@ if (!aFaire.length) {
 }
 ```
 
+## Pagination d'un HTTP node (W27/W28)
+
+- **W27 — 🚨 un HTTP node paginé sort UN ITEM PAR PAGE** : le node suivant s'exécute une fois **par page** → duplication en aval (vécu 2026-08-19 : 84 entrées × 5 pages = 420 lignes d'export). Réflexes : le consommateur agrège TOUTES les pages (`$input.all().flatMap(p => p.json.records || [])`) et **déduplique par id** ; placer les fetchs multi-pages en **fin de chaîne** quand c'est possible ; dans l'URL d'un node situé APRÈS un node paginé, référencer `$('Prep')` **explicitement**, jamais `$json` (qui change à chaque item/page).
+- **W28 — 🚨 un fetch « toute la table » NON paginé tronque en SILENCE au pageSize** : le jour où la table dépasse le cap, le dict bâti dessus ment — et une idempotence par clé naturelle (get-or-create, « existe déjà ? ») se met à créer des **doublons**. Si on choisit de ne pas paginer (légitime quand W27 mordrait la chaîne), poser une **garde bruyante** dans le consommateur : `if ((p.json.records || []).length >= PAGE_SIZE) throw new Error('fetch tronqué — paginer')`. 3 lignes, posées le 2026-08-19 sur un fetch à 235/1000 rows — la bombe désamorcée avant d'exploser.
+
 ## IF node (W5/W21)
 
 - **W5** : `conditions.options = {version:2, leftValue:"", caseSensitive:true, typeValidation:"strict"}` est **obligatoire** (le validator MCP refuse sinon).
@@ -148,6 +153,8 @@ Sur un site sans MCP (le canal recommandé depuis 2026-07), on patche en `GET �
 
 - **W25 — 🚨 un PUT qui change le GRAPHE n'est PAS pris en compte par l'instance active.** W18 (« actif immédiatement ») ne vaut que pour un changement de **paramètres**. Dès qu'on **ajoute des nodes ou des connexions**, l'instance active continue de servir **l'ancien graphe** : le GET de contrôle montre bien les nouveaux nodes et les bonnes connexions, mais l'exécution n'en enchaîne que les anciens — on croit à un bug de son propre code. ➡️ **`POST /activate` après `POST /deactivate`** à chaque changement de graphe. À mettre dans le script de patch, pas dans la tête.
 - **W26 — 🚨 `nodeCredentialType` SEUL ne suffit pas sur un node créé par l'API.** Un node HTTP construit à la main avec `authentication: predefinedCredentialType` + `nodeCredentialType: 'nocoDbApiToken'` part en **`Credentials not found`** au runtime — l'objet `credentials` est un champ **à part**, absent par défaut. Le workflow paraît parfait à la relecture API. ➡️ **Recopier `credentials` d'un node voisin qui marche** : `{'nocoDbApiToken': {'id': '…', 'name': '…'}}`.
+
+- **L'assertion post-PUT doit viser le CHAMP précis, pas le JSON entier** : `assert 'X' not in json.dumps(nodes)` échoue à tort si le **commentaire** posé par le patch mentionne X — vécu deux fois dans le même script le 2026-08-19. Asserter sur `node['parameters']['url']` ou le `jsCode` du node visé. Même classe de piège pour un **auditeur d'URLs** : parser les *expressions* (`={{ … }}`), pas la string brute — une regex qui tronque à la première quote a rendu ~50 % de faux positifs « fetch non borné » (les `where={{ encodeURIComponent(…) }}` invisibles).
 
 **Le garde-fou qui rend ces deux pièges bénins** : sauvegarder le workflow (`GET` → fichier) **avant** le patch, et écrire le script de patch avec des **assertions sur l'état de départ** (nom du workflow, présence des nodes attendus, code exact des Code nodes touchés, connexions attendues) — puis `--dry-run` par défaut, `--execute` explicite. Un patch qui échoue bruyamment sur un état inattendu vaut mieux qu'un patch qui « marche » sur un workflow qui a bougé. Restaurer = un PUT du fichier de sauvegarde.
 
