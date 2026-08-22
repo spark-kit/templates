@@ -107,6 +107,17 @@ method = ={{ $json.method }}   url = ={{ $json.url }}   jsonBody = ={{ $json.bod
 
 ---
 
+
+## Conflit d'unicité & corrélation d'erreurs (W29/W30)
+
+- **W29 — branche conflit d'unicité (insert-first)** : sous index unique NocoDB (`unique:true`, cf. `spark-nocodb-v3-patterns` N41), ne PAS pré-checker (`Find → IF → Insert` garde la course, et un `where=(nom,eq,…)` casse sur une valeur à virgule). L'Insert porte `onError: continueErrorOutput` :
+  - sortie **0** (succès) → chemin nominal inchangé ;
+  - sortie **1** (conflit) → `Refetch` par clé → réponse `{success:true, id, created:false, already:true}` — et **throw** si un attribut demandé diverge du record existant (jamais de rattachement silencieux au mauvais parent).
+
+  Variante webhook encaissé (Respond early, re-livraisons possibles) : le PERDANT d'une course concurrente peut simplement s'arrêter — un Code node « Guard Conflit » qui `return []` sur `UNIQUE_CONSTRAINT` (le gagnant déroule la suite de la chaîne), et **re-throw toute autre erreur** vers l'errorWorkflow. ⚠️ le `return []` est un W24 assumé : le commenter pour que personne ne le « répare ».
+
+- **W30 — `$execution.id` : corrélation exacte fiche de suivi ↔ errorWorkflow.** Un GET status qui « croise » la table d'erreurs par `workflow_name` + fenêtre temporelle attribue le crash d'un run à un AUTRE run du même workflow (deux imports concurrents → le vivant est marqué mort). Fix en 2 lignes : le workflow stampe `execution_id: String($execution.id)` sur sa fiche de suivi dès le démarrage ; le status filtre `(execution_id,eq,<celui de la fiche>)` — l'errorWorkflow stocke déjà l'execution_id du run planté. Fiche legacy sans le champ → sentinelle qui ne matche rien (jamais un filtre large en repli). `$execution.id` est disponible dans tout Code node (vérifié n8n 2.x via workflow jetable).
+
 ## NocoDB depuis n8n (W6/W7/W8)
 
 - **Credential natif** `nocoDbApiToken` (libellé "API Token"), **pas** `httpHeaderAuth` générique (W6).

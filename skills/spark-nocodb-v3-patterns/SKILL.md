@@ -11,7 +11,7 @@ metadata:
 # NocoDB v3 — pièges & patterns Spark
 
 > Couche **empirique** au-dessus de la skill `nocodb` (qui documente l'API v3 brute).
-> Ici : ce qui fait perdre 20-60 min à découvrir et 3 s à éviter. Cristallisé sur la chaîne WMS v2 (102 assertions E2E, 6 PRDs) puis enrichi en continu — 2026-07-31 : **N34-N36** (un même chantier de re-liaison, tous les trois silencieux) · 2026-08-05 : **N37-N39** (coût caché d'un lien en lecture, sémantique d'écriture par `relation_type`) · 2026-08-19 : **N40** (where date) + nuances N33/N37 (la falaise se franchit en jours ; `isblank` sur Link peut rendre 42804).
+> Ici : ce qui fait perdre 20-60 min à découvrir et 3 s à éviter. Cristallisé sur la chaîne WMS v2 (102 assertions E2E, 6 PRDs) puis enrichi en continu — 2026-07-31 : **N34-N36** (un même chantier de re-liaison, tous les trois silencieux) · 2026-08-05 : **N37-N39** (coût caché d'un lien en lecture, sémantique d'écriture par `relation_type`) · 2026-08-19 : **N40** (where date) + nuances N33/N37 (la falaise se franchit en jours ; `isblank` sur Link peut rendre 42804) · 2026-08-22 : **N41** (`unique:true` existe en CE — corrige N36 ; insert-first).
 > **Cible : NocoDB Community Edition 2026.04.5+, API v3, PAT (`xc-token`).**
 
 ---
@@ -129,7 +129,7 @@ Les Lookups sont la bonne arme contre le N+1 sur les agrégats — mais 6 chauss
 
 ---
 
-## Idempotence & concurrence (N36)
+## Idempotence & concurrence (N36/N41)
 
 **N36 — 🚨 un get-or-create NocoDB n'est pas atomique : appelé en fan-out sur la même clé, il crée des doublons.** Le pattern canonique d'un endpoint « résoudre-ou-créer » est `Find (where=clé)` → `IF Exists` → `Insert`. Correct appelé une fois. Mais un node HTTP n8n **itère sur ses items d'entrée** : N items visant la même clé produisent N `Find` qui ne trouvent rien, puis N `Insert`.
 
@@ -138,12 +138,27 @@ item A → clé "APP-IP11-64-MX-C0210"  ┐ les deux Find ne trouvent rien,
 item B → clé "APP-IP11-64-MX-C0210"  ┘ les deux insèrent → 2 records, même clé
 ```
 
-NocoDB **n'a pas de contrainte d'unicité applicative** sur un SingleLineText : rien ne refuse le second insert. Le doublon ne casse rien tout de suite — il casse **au coup suivant**, quand un consommateur résout `clé → id` : un `dict[clé] = id` garde le dernier, et une écriture ciblée (DELETE d'un lien, PATCH) frappe le jumeau. Le symptôme apparaît alors à plusieurs nœuds de la cause, dans une exécution *antérieure*.
+Sans contrainte posée (cf. **N41** — `unique:true` existe et ferme cette course), rien ne refuse le second insert. Le doublon ne casse rien tout de suite — il casse **au coup suivant**, quand un consommateur résout `clé → id` : un `dict[clé] = id` garde le dernier, et une écriture ciblée (DELETE d'un lien, PATCH) frappe le jumeau. Le symptôme apparaît alors à plusieurs nœuds de la cause, dans une exécution *antérieure*.
 
 **Trois remèdes, cumulatifs** :
 1. **Dédupliquer AVANT le fan-out** — un item par clé cible distincte, puis ré-étaler le résultat sur les items d'origine (`byCle[réponse.clé] = id`).
 2. **Ne jamais résoudre par clé naturelle ce qu'on peut lire directement** — pour délier, lire les liens réels du record (`GET /links`) plutôt que traduire une clé en id. Robuste aux doublons *et* aux N34 déjà en place.
 3. **Un invariant d'unicité dans le harnais E2E** — `SELECT clé HAVING count(*) > 1` sur la table de référence. Sur un cas réel, il a immédiatement sorti un doublon **préexistant** que personne n'avait vu : la classe de bug était déjà là.
+
+
+**N41 — `unique:true` EXISTE en CE et rend l'idempotence atomique — mais poser la contrainte ne suffit pas.** Vérifié 2026-08-22 (CE 2026.04.5+) : `PATCH meta/bases/{base}/fields/{field}` body `{"unique":true}` crée un vrai index ; l'insert doublon rend un JSON propre :
+
+```jsonc
+{ "error": "FIELD_UNIQUE_CONSTRAINT_VIOLATION",
+  "message": "numero field unique constraint violation. Value '…' already exists." }
+```
+
+Trois règles, vécues le même jour sur 4 colonnes :
+1. **Pré-check doublons AVANT de poser** (fetch paginé + Counter sur la colonne) : un doublon existant ne bloque pas la pose mais reste en base — le résoudre d'abord (fusion), sinon la contrainte « protège » un état déjà faux.
+2. **Relire TOUS les writers, même ceux qui « vérifient déjà »** : une contrainte révèle les inserts aveugles. Vécu : la garde métier laissait passer un cas LÉGITIME de ré-écriture (retour d'un objet déjà sorti) puis faisait un POST aveugle d'un second record — avec la contrainte, ce flux légitime meurt en 409. Le fix n'est pas d'enlever la contrainte mais de faire **réutiliser** le record existant (purge des liens lus N39 + re-pointage).
+3. **La course concurrente devient une erreur bruyante** (→ errorWorkflow) au lieu d'un doublon silencieux qui casse trois nœuds plus loin (N36). C'est le comportement voulu — prévoir la branche conflit côté n8n (cf. `spark-n8n-pseudo-api` W29).
+
+**Corollaire — insert-first > check-then-insert** : sous index unique, l'insert **EST** le check. Un endpoint get-or-create n'a plus besoin du pré-check `Find (where=clé)` (TOCTOU intact, et un `where=(nom,eq,…)` casse sur une valeur à virgule/parenthèse) : insérer directement, et traiter le conflit dans la branche erreur (Refetch par clé → réponse « existing »). Moins de nodes, zéro course. NB : plusieurs `null` coexistent sous l'index (sémantique Postgres) — une clé absente ne bloque rien.
 
 > Corollaire de méthode : « risque de concurrence documenté et assumé » sur une écriture unitaire ne l'assume **pas** en fan-out. C'est la même ligne de code, avec N appels au lieu d'un. Re-qualifier le risque quand l'appelant change de forme. (Vécu 2026-07-31.)
 
@@ -190,6 +205,7 @@ NocoDB **n'a pas de contrainte d'unicité applicative** sur un SingleLineText : 
 5. Lecture de l'id créé ? → `records[0].id`.
 6. GET par id ? → `?fields=` systématique, sinon 10-35× plus lent (N28).
 7. Écriture de lien **rejouable** ? → le POST **ajoute** sur un `belongsTo` (N34) mais **remplace** sur un `mo` — lire `relation_type` avant d'écrire (N38) ; un `mm` est idempotent, une ligne de **jonction** non : la lire avant de la créer, et ne DELETE que des ids lus (N39).
-8. Un endpoint qui reçoit un id de ligne « à mettre à jour » de son appelant ? → le **résoudre lui-même** (`where` sur les colonnes scalaires dénormalisées, N8b — ça, ça filtre) plutôt que de faire confiance : deux appelants finissent toujours par diverger, et c'est l'écrivain qui porte l'invariant. (Vécu : 138 lignes dupliquées sur 555.)
+8. Endpoint get-or-create / clé naturelle censée être unique ? → poser `unique:true` (N41 : pré-check doublons, relire les writers) et faire **insert-first** avec branche conflit (W29) plutôt que Find→IF→Insert.
+9. Un endpoint qui reçoit un id de ligne « à mettre à jour » de son appelant ? → le **résoudre lui-même** (`where` sur les colonnes scalaires dénormalisées, N8b — ça, ça filtre) plutôt que de faire confiance : deux appelants finissent toujours par diverger, et c'est l'écrivain qui porte l'invariant. (Vécu : 138 lignes dupliquées sur 555.)
 
 > Promouvoir tout nouveau piège confirmé ici **et** dans `spark-kit/INCIDENTS.md` s'il est transverse à plusieurs sites.

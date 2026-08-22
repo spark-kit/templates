@@ -284,3 +284,5 @@ nc where:help
 ```
 
 Arguments accept names (resolved automatically) or IDs (faster). Set `NOCODB_VERBOSE=1` to see ID resolution.
+
+⚠️ Name resolution can fail for some tables even when they exist (seen 2026-08-22: `record:list <base> modeles` → `Table 'modeles' not found`). On an unexpected "not found", retry with the raw ID (`m…` table / `c…` field) before digging further — every command accepts IDs wherever it accepts names.
